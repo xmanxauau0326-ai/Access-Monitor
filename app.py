@@ -96,24 +96,46 @@ socketio = SocketIO(
 # ------------------------------------------------------------------
 _supabase = None
 _supabase_sig = None
+_supabase_error = None          # 初期化に失敗した理由（値を含まない要約）
+
+
+def get_supabase_error():
+    return _supabase_error
 
 
 def get_supabase():
     """Supabase クライアント。設定が揃った時点で初めて生成する。"""
-    global _supabase, _supabase_sig
+    global _supabase, _supabase_sig, _supabase_error
     url = (cfg("https://tjrlshkuwsfbvttqrafg.supabase.co") or "").strip()
     key = ((cfg("sb_secret_ItGVE13xAzc-IZu_ZKd6lQ_mqOJYkwx") or "").strip()
            or (cfg("SUPABASE_KEY") or "").strip())
-    if create_client is None or not url or not key:
+    if create_client is None:
+        _supabase_error = "supabase パッケージが読み込めません（import 失敗）"
+        return None
+    if not url:
+        _supabase_error = "SUPABASE_URL が空です"
+        return None
+    if not key:
+        _supabase_error = "SUPABASE_SERVICE_ROLE_KEY が空です"
         return None
     sig = (url, key)
     if _supabase is None or _supabase_sig != sig:
         try:
             _supabase = create_client(url, key)
             _supabase_sig = sig
+            _supabase_error = None
             logger.info("Supabase クライアント初期化 OK")
         except Exception as exc:  # noqa: BLE001
-            logger.error("Supabase 初期化失敗: %s", exc)
+            # 例外文にURLや鍵が混ざる場合があるため種別のみ記録する
+            _supabase_error = "%s: %s" % (type(exc).__name__, str(exc)[:200])
+            if "Invalid API key" in str(exc):
+                # supabase-py 2.6.0 は新形式 sb_secret_... を JWT とみなせず
+                # ここで落ちる。原因が分かるように明示する。
+                _supabase_error = (
+                    "Invalid API key — supabase==2.6.0 は新形式 sb_secret_ に"
+                    "未対応です。requirements.txt の supabase を更新するか、"
+                    "Supabase の Legacy service_role キー（eyJ…）を使ってください")
+            logger.error("Supabase 初期化失敗: %s", _supabase_error)
             return None
     return _supabase
 
@@ -486,6 +508,7 @@ def api_health():
     return jsonify({
         "status": "ok",
         "supabase": get_supabase() is not None,
+        "supabase_error": get_supabase_error(),
         "geoip": get_geoip_reader() is not None,
         "admin_token_set": bool(get_admin_token()),
         "admin_token_length": len(get_admin_token()),
