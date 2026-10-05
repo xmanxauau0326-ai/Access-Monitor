@@ -71,6 +71,20 @@ if create_client and SUPABASE_URL and SUPABASE_KEY:
         logger.info("Supabase クライアント初期化 OK")
     except Exception as exc:  # noqa: BLE001
         logger.error("Supabase 初期化失敗: %s", exc)
+else:
+    # どの変数が届いていないかを名指しで記録する（値は絶対に出さない）
+    missing = []
+    if create_client is None:
+        missing.append("supabase パッケージ")
+    if not SUPABASE_URL:
+        missing.append("SUPABASE_URL")
+    if not SUPABASE_KEY:
+        missing.append("SUPABASE_SERVICE_ROLE_KEY")
+    logger.error("【設定不足】%s が届いていません。この状態では"
+                 "アクセスは1件も保存されません。"
+                 "Render の Environment で登録し、"
+                 "「Save and deploy」で反映してください。",
+                 " / ".join(missing) if missing else "(原因不明)")
 
 _geoip_reader = None
 _geoip_lock = threading.Lock()
@@ -402,17 +416,43 @@ def api_targets_delete():
     return jsonify({"status": "ok", "targets": list_targets()})
 
 
+# 期待する環境変数の名前（値は絶対に扱わない）
+EXPECTED_ENV = ("SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "ADMIN_TOKEN",
+                "PYTHON_VERSION", "SECRET_KEY", "FLASK_ENV",
+                "RETENTION_DAYS", "ALLOWED_ORIGINS")
+
+
+def env_report():
+    """環境変数の「名前」と「空かどうか」だけを返す。値は絶対に含めない。
+
+    Render の Shell は有料プラン限定のため、これで代用する。
+    キー名に空白が混ざっている場合も repr() で見えるようにしている。
+    """
+    found = {}
+    for k in os.environ:
+        u = k.strip().upper()
+        if u in EXPECTED_ENV and k not in EXPECTED_ENV:
+            found[repr(k)] = "キー名に余分な空白あり"   # 例: 'ADMIN_TOKEN '
+    present = {k: ("空" if not os.environ.get(k) else "OK(len=%d)" % len(os.environ[k]))
+               for k in EXPECTED_ENV if k in os.environ}
+    missing = [k for k in EXPECTED_ENV if k not in os.environ]
+    return {"present": present, "missing": missing, "suspicious_keys": found}
+
+
 @app.route("/api/health", methods=["GET"])
 def api_health():
     # admin_token_set = サーバーが ADMIN_TOKEN を受け取れているか
     # （値そのものは絶対に出さない）
-    return jsonify({
+    body = {
         "status": "ok",
         "supabase": supabase is not None,
         "geoip": get_geoip_reader() is not None,
         "admin_token_set": bool(ADMIN_TOKEN),
         "admin_token_length": len(ADMIN_TOKEN),
-    })
+    }
+    # 名前と空かどうかだけ。値は絶対に出さない。
+    body.update(env_report())
+    return jsonify(body)
 
 
 # ------------------------------------------------------------------
@@ -460,6 +500,30 @@ def cleanup_loop():
 _bg_started = False
 
 
+def log_config_summary():
+    """起動時に、必要な値が届いているかだけを記録する（値そのものは出さない）"""
+    logger.info("---- 設定の読み込み状況 ----")
+    logger.info("SUPABASE_URL              : %s",
+                "OK" if SUPABASE_URL else "未設定")
+    logger.info("SUPABASE_SERVICE_ROLE_KEY : %s",
+                "OK" if SUPABASE_KEY else "未設定")
+    logger.info("ADMIN_TOKEN               : %s",
+                "OK(長さ%d)" % len(ADMIN_TOKEN) if ADMIN_TOKEN else "未設定")
+    logger.info("RETENTION_DAYS            : %s", RETENTION_DAYS)
+    logger.info("ALLOWED_ORIGINS           : %s", ALLOWED_ORIGINS)
+    logger.info("--------------------------")
+    # 環境変数の「名前」だけを一覧する（値は絶対に出さない）。
+    # キー名の前後に空白があるとアプリからは「未設定」に見えるため、
+    # repr() で空白を可視化する。
+    import os as _os
+    keys = sorted(k for k in _os.environ
+                  if any(t in k.upper() for t in
+                         ("SUPABASE", "ADMIN", "SECRET", "RETENTION",
+                          "ALLOWED", "PYTHON", "FLASK", "MAXMIND", "COLLECT")))
+    logger.info("検出した環境変数の名前: %s",
+                [repr(k) for k in keys] if keys else "(該当なし)")
+
+
 def start_background_jobs():
     global _bg_started
     if _bg_started:
@@ -471,6 +535,7 @@ def start_background_jobs():
 
 
 start_background_jobs()
+log_config_summary()
 
 
 # ------------------------------------------------------------------
