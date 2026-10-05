@@ -30,6 +30,9 @@ logger = logging.getLogger(__name__)
 
 BACKEND_URL = os.getenv("ACCESS_MONITOR_BACKEND", "http://localhost:5000")
 COLLECT_TOKEN = os.getenv("ACCESS_MONITOR_TOKEN", "")
+# 監視対象サイトのホスト名（例: example.com）。
+# 未設定の場合は、受信リクエストの Host ヘッダーから自動で判定する。
+SITE = os.getenv("ACCESS_MONITOR_SITE", "")
 
 _queue: "queue.Queue[dict]" = queue.Queue(maxsize=10000)
 _started = False
@@ -77,6 +80,9 @@ def record(request, status_code=None):
     """1アクセスを記録（非同期・ノンブロッキング）"""
     _ensure_sender()
     try:
+        # 監視対象サイトのホスト名。ACCESS_MONITOR_SITE 未設定なら Host ヘッダーを使う。
+        host = request.headers.get("Host", "") or ""
+        site = SITE or host.split(":")[0]
         row = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "ip": _client_ip(request),
@@ -85,29 +91,13 @@ def record(request, status_code=None):
             "status_code": status_code,
             "user_agent": request.headers.get("User-Agent", "")[:512],
             "referer": request.headers.get("Referer", "")[:512],
+            "site": site or None,
         }
         _queue.put_nowait(row)
     except queue.Full:
         logger.warning("collect キューが満杯。1件破棄しました。")
     except Exception as exc:  # noqa: BLE001
         logger.debug("record 失敗: %s", exc)
-
-
-def init_app(app, backend_url=None, collect_token=None):
-    """Flask アプリに組み込む"""
-    global BACKEND_URL, COLLECT_TOKEN
-    if backend_url:
-        BACKEND_URL = backend_url
-    if collect_token:
-        COLLECT_TOKEN = collect_token
-
-    @app.after_request
-    def _after(response):  # noqa: ANN001
-        record(request=response.request if hasattr(response, "request") else None_guard(),
-               status_code=response.status_code)
-        return response
-
-    return app
 
 
 # --- Flask 用の実装（request コンテキストを使う版） ---
