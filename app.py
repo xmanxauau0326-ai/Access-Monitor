@@ -142,7 +142,7 @@ def get_supabase_error():
 def get_supabase():
     """Supabase クライアント。設定が揃った時点で初めて生成する。"""
     global _supabase, _supabase_sig, _supabase_error
-    url = _env_clean("https://tjrlshkuwsfbvttqrafg.supabase.co")
+    url = _env_clean("SUPABASE_URL")
     key = _env_clean("sb_secret_ItGVE13xAzc-IZu_ZKd6lQ_mqOJYkwx", "SUPABASE_KEY")
     if create_client is None:
         _supabase_error = "supabase パッケージが読み込めません（import 失敗）"
