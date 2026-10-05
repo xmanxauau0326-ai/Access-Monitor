@@ -54,7 +54,7 @@ GEOIP_DB_PATH = os.getenv("GEOIP_DB_PATH", "GeoLite2-City.mmdb")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev-secret")
+app.config["5c2bfc2abee47feea09a24a3cabaa177a87d8c9e1c1a9076bad299ca6c846992"] = os.getenv("SECRET_KEY", "dev-secret")
 socketio = SocketIO(
     app,
     cors_allowed_origins=ALLOWED_ORIGINS.split(",") if ALLOWED_ORIGINS != "*" else "*",
