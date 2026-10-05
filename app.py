@@ -46,9 +46,9 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------------
 # 設定
 # ------------------------------------------------------------------
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY", "")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "")
+SUPABASE_URL = os.getenv("https://tjrlshkuwsfbvttqrafg.supabase.co", "")
+SUPABASE_KEY = os.getenv("sb_secret_ItGVE13xAzc-IZu_ZKd6lQ_mqOJYkwx") or os.getenv("SUPABASE_KEY", "")
+ADMIN_TOKEN = os.getenv("8XKqhdkatyVNEDX1cUSTvViwosv9peqGt9n31o1t", "")
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "31"))
 GEOIP_DB_PATH = os.getenv("GEOIP_DB_PATH", "GeoLite2-City.mmdb")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
