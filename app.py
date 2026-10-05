@@ -64,6 +64,19 @@ logger = logging.getLogger(__name__)
 #   ・値は Unicode の空白文字を「すべて」除去する
 #   という方式にする（URL も鍵も空白を含まないため安全）。
 # ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# Supabase の Project URL 既定値
+#
+#   Project URL はブラウザに露出する公開情報であり、秘密情報ではない
+#   （Supabase の公式クライアントはこの URL をブラウザ側で使う）。
+#   環境変数 SUPABASE_URL が未設定・空白のみの場合にこれを使う。
+#
+#   【重要】Secret key（sb_secret_… / service_role）は絶対にここへ書かない。
+#           鍵は環境変数からのみ読む。
+# ------------------------------------------------------------------
+DEFAULT_SUPABASE_URL = "https://tjrlshkuwsfbvttqrafg.supabase.co"
+
+
 def _env_map():
     """{正規化したキー名: 生の値} を返す"""
     out = {}
@@ -142,8 +155,8 @@ def get_supabase_error():
 def get_supabase():
     """Supabase クライアント。設定が揃った時点で初めて生成する。"""
     global _supabase, _supabase_sig, _supabase_error
-    url = _env_clean("SUPABASE_URL")
-    key = _env_clean("sb_secret_ItGVE13xAzc-IZu_ZKd6lQ_mqOJYkwx", "SUPABASE_KEY")
+    url = _env_clean("SUPABASE_URL") or DEFAULT_SUPABASE_URL
+    key = _env_clean("SUPABASE_SERVICE_ROLE_KEY", "SUPABASE_KEY")
     if create_client is None:
         _supabase_error = "supabase パッケージが読み込めません（import 失敗）"
         return None
@@ -524,6 +537,55 @@ EXPECTED_ENV = ("SUPABASE_URL", "SUPABASE_SERVICE_ROLE_KEY", "ADMIN_TOKEN",
                 "RETENTION_DAYS", "ALLOWED_ORIGINS")
 
 
+def supabase_selftest():
+    """Supabase への実接続を1回試す。鍵が有効かの最終判定に使う。"""
+    sb = get_supabase()
+    if sb is None:
+        return {"ok": False, "error": get_supabase_error()}
+    try:
+        sb.table("access_logs").select("id").limit(1).execute()
+        return {"ok": True}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False,
+                "error": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
+
+
+def env_shapes():
+    """各変数の「形」だけを報告する。値そのものは絶対に含めない。
+
+    - 空白のみの値：空白は秘密情報ではないので、コードポイントで種類を示す
+      （例 U+3000 = 全角スペース、U+0020 = 半角スペース）
+    - それ以外：URLらしいか／鍵らしいか、といった真偽値のみ
+    """
+    import unicodedata  # noqa: F401  (将来の拡張用)
+    env = _env_map()
+    out = {}
+    for k in EXPECTED_ENV:
+        v = env.get(k)
+        if v is None:
+            out[k] = {"state": "missing"}
+            continue
+        clean = _env_clean(k)
+        rec = {
+            "raw_len": len(v),
+            "clean_len": len(clean),
+            "without_ascii_ws_len": len(
+                "".join(ch for ch in v if ch not in " \t\r\n")),
+        }
+        if len(v) > 0 and not clean:
+            rec["all_whitespace"] = True
+            rec["codepoints"] = sorted({"U+%04X" % ord(ch) for ch in v})
+        else:
+            rec["all_whitespace"] = False
+            if k.endswith("URL"):
+                rec["starts_https"] = clean.startswith("https://")
+                rec["is_supabase_co"] = clean.endswith(".supabase.co")
+            if "KEY" in k or "TOKEN" in k:
+                rec["starts_sb_secret"] = clean.startswith("sb_secret_")
+        out[k] = rec
+    return out
+
+
 def env_report():
     """環境変数の「名前」と「空かどうか」だけを返す。値は絶対に含めない。
 
@@ -552,6 +614,10 @@ def api_health():
         "admin_token_set": bool(get_admin_token()),
         "admin_token_length": len(get_admin_token()),
         **env_report(),
+        "shapes": env_shapes(),
+        "supabase_url_source": (
+            "env" if _env_clean("SUPABASE_URL") else "default(埋め込み)"),
+        "supabase_test": supabase_selftest(),
     })
 
 
