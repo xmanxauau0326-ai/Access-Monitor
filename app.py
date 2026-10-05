@@ -13,6 +13,12 @@ Flask + Flask-SocketIO + Supabase + MaxMind GeoLite2
   6. 管理者向け REST API（統計・直近・検知）
   7. Socket.IO による秒単位のプッシュ配信
   8. 管理者ダッシュボード(templates/dashboard.html)の配信
+
+【設計上の重要事項：設定は「使うたび」に読む】
+  Render 上で「モジュール読み込み時点では環境変数が空、リクエスト処理時には
+  入っている」という事象が実際に確認された。そのため、設定値は import 時に
+  定数へ固定せず、必要になった時点で os.environ から読む。
+  （os.getenv は辞書参照なので性能上の問題はない）
 """
 import os
 import re
@@ -37,78 +43,109 @@ try:
 except ImportError:
     create_client = None
 
+# .env があれば読み込む（Render では環境変数が直接入る）
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-# ------------------------------------------------------------------
-# 設定
-# ------------------------------------------------------------------
-SUPABASE_URL = os.getenv("https://tjrlshkuwsfbvttqrafg.supabase.co", "")
-SUPABASE_KEY = os.getenv("sb_secret_ItGVE13xAzc-IZu_ZKd6lQ_mqOJYkwx") or os.getenv("SUPABASE_KEY", "")
-ADMIN_TOKEN = os.getenv("8XKqhdkatyVNEDX1cUSTvViwosv9peqGt9n31o1t", "").strip()
-RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "31"))
-GEOIP_DB_PATH = os.getenv("GEOIP_DB_PATH", "GeoLite2-City.mmdb")
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
 
+# ------------------------------------------------------------------
+# 設定：毎回 os.environ から読む
+# ------------------------------------------------------------------
+def cfg(name, default=""):
+    """環境変数を「その都度」読む。値は文字列。"""
+    v = os.getenv(name)
+    return default if v is None else v
+
+
+def get_admin_token():
+    """管理者トークン（前後の空白・改行は無視する）"""
+    return (cfg("ADMIN_TOKEN") or "").strip()
+
+
+def get_retention_days():
+    try:
+        return int((cfg("RETENTION_DAYS", "31") or "31").strip())
+    except (TypeError, ValueError):
+        return 31
+
+
+def get_geodb_path():
+    return (cfg("GEOIP_DB_PATH", "GeoLite2-City.mmdb") or "").strip()
+
+
+# ------------------------------------------------------------------
+# Flask / Socket.IO
+# ------------------------------------------------------------------
 app = Flask(__name__)
-app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev-secret")
+app.config["SECRET_KEY"] = cfg("SECRET_KEY", "dev-secret")
+
+_origins = (cfg("ALLOWED_ORIGINS", "*") or "*").strip() or "*"
 socketio = SocketIO(
     app,
-    cors_allowed_origins=ALLOWED_ORIGINS.split(",") if ALLOWED_ORIGINS != "*" else "*",
+    cors_allowed_origins=("*" if _origins == "*"
+                          else [o for o in _origins.split(",") if o]),
     async_mode="eventlet",
 )
 
-# ------------------------------------------------------------------
-# クライアント初期化
-# ------------------------------------------------------------------
-supabase = None
-if create_client and SUPABASE_URL and SUPABASE_KEY:
-    try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        logger.info("Supabase クライアント初期化 OK")
-    except Exception as exc:  # noqa: BLE001
-        logger.error("Supabase 初期化失敗: %s", exc)
-else:
-    # どの変数が届いていないかを名指しで記録する（値は絶対に出さない）
-    missing = []
-    if create_client is None:
-        missing.append("supabase パッケージ")
-    if not SUPABASE_URL:
-        missing.append("SUPABASE_URL")
-    if not SUPABASE_KEY:
-        missing.append("SUPABASE_SERVICE_ROLE_KEY")
-    logger.error("【設定不足】%s が届いていません。この状態では"
-                 "アクセスは1件も保存されません。"
-                 "Render の Environment で登録し、"
-                 "「Save and deploy」で反映してください。",
-                 " / ".join(missing) if missing else "(原因不明)")
 
+# ------------------------------------------------------------------
+# Supabase クライアント（遅延生成・使い回し）
+# ------------------------------------------------------------------
+_supabase = None
+_supabase_sig = None
+
+
+def get_supabase():
+    """Supabase クライアント。設定が揃った時点で初めて生成する。"""
+    global _supabase, _supabase_sig
+    url = (cfg("https://tjrlshkuwsfbvttqrafg.supabase.co") or "").strip()
+    key = ((cfg("sb_secret_ItGVE13xAzc-IZu_ZKd6lQ_mqOJYkwx") or "").strip()
+           or (cfg("SUPABASE_KEY") or "").strip())
+    if create_client is None or not url or not key:
+        return None
+    sig = (url, key)
+    if _supabase is None or _supabase_sig != sig:
+        try:
+            _supabase = create_client(url, key)
+            _supabase_sig = sig
+            logger.info("Supabase クライアント初期化 OK")
+        except Exception as exc:  # noqa: BLE001
+            logger.error("Supabase 初期化失敗: %s", exc)
+            return None
+    return _supabase
+
+
+# ------------------------------------------------------------------
+# GeoIP（遅延ロード・スレッドセーフ）
+# ------------------------------------------------------------------
 _geoip_reader = None
+_geoip_path_loaded = None
 _geoip_lock = threading.Lock()
 
 
 def get_geoip_reader():
-    """GeoLite2 リーダーを遅延ロード（スレッドセーフ）"""
-    global _geoip_reader
+    global _geoip_reader, _geoip_path_loaded
     if geoip2 is None:
         return None
-    if _geoip_reader is None:
-        with _geoip_lock:
-            if _geoip_reader is None:
-                try:
-                    _geoip_reader = geoip2.database.Reader(GEOIP_DB_PATH)
-                    logger.info("GeoIP DB ロード OK: %s", GEOIP_DB_PATH)
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("GeoIP DB をロードできません (%s): %s",
-                                   GEOIP_DB_PATH, exc)
-                    return None
+    path = get_geodb_path()
+    if _geoip_reader is not None and _geoip_path_loaded == path:
+        return _geoip_reader
+    with _geoip_lock:
+        if _geoip_reader is None or _geoip_path_loaded != path:
+            try:
+                _geoip_reader = geoip2.database.Reader(path)
+                _geoip_path_loaded = path
+                logger.info("GeoIP DB ロード OK: %s", path)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("GeoIP DB をロードできません (%s): %s", path, exc)
+                return None
     return _geoip_reader
 
 
-def lookup_geo(ip: str) -> dict:
+def lookup_geo(ip):
     """IP → 国・都市・座標"""
     reader = get_geoip_reader()
     result = {"country_code": None, "country_name": None,
@@ -186,10 +223,11 @@ def normalize_url(v):
 
 def list_targets(hours=24):
     """登録済みの監視対象（直近24時間のヒット数を添えて）"""
-    if supabase is None:
+    sb = get_supabase()
+    if sb is None:
         return []
     try:
-        res = (supabase.table("targets")
+        res = (sb.table("targets")
                .select("id,url,host,added")
                .order("id")
                .execute())
@@ -201,7 +239,7 @@ def list_targets(hours=24):
 
     counts = {}
     try:
-        rpc = supabase.rpc("target_counts", {"p_hours": hours}).execute()
+        rpc = sb.rpc("target_counts", {"p_hours": hours}).execute()
         for r in (rpc.data or []):
             counts[r.get("host")] = r.get("hits") or 0
     except Exception as exc:  # noqa: BLE001
@@ -216,14 +254,14 @@ def add_target(raw):
     n = normalize_url(raw)
     if not n:
         return None, "URLの形式が正しくありません（例: https://example.com）"
-    if supabase is None:
-        return None, "Supabase に接続できていません"
+    sb = get_supabase()
+    if sb is None:
+        return None, "Supabase に接続できていません（環境変数を確認してください）"
     try:
-        chk = (supabase.table("targets")
-               .select("id").eq("host", n["host"]).execute())
+        chk = sb.table("targets").select("id").eq("host", n["host"]).execute()
         if chk.data:
             return None, "すでに登録されています: %s" % n["host"]
-        supabase.table("targets").insert({
+        sb.table("targets").insert({
             "url": n["url"],
             "host": n["host"],
             "added": datetime.now(timezone.utc).isoformat(),
@@ -234,10 +272,11 @@ def add_target(raw):
 
 
 def delete_target(host):
-    if supabase is None:
+    sb = get_supabase()
+    if sb is None:
         return False
     try:
-        supabase.table("targets").delete().eq("host", host).execute()
+        sb.table("targets").delete().eq("host", host).execute()
         return True
     except Exception as exc:  # noqa: BLE001
         logger.error("target 削除失敗 host=%s: %s", host, exc)
@@ -248,13 +287,13 @@ def delete_target(host):
 # 認証ヘルパ
 # ------------------------------------------------------------------
 def require_admin():
-    # 前後の空白・改行が混ざっていても一致するように strip する
     token = (request.headers.get("X-Admin-Token")
              or request.args.get("token")
              or "").strip()
-    if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+    expected = get_admin_token()
+    if not expected or token != expected:
         logger.warning("認証失敗: admin_token_set=%s / 受信トークンの長さ=%d",
-                       bool(ADMIN_TOKEN), len(token))
+                       bool(expected), len(token))
         abort(401)
 
 
@@ -264,7 +303,8 @@ def require_admin():
 @app.route("/api/collect", methods=["POST"])
 def api_collect():
     payload = request.get_json(silent=True) or {}
-    ip = payload.get("ip") or request.headers.get("X-Forwarded-For", request.remote_addr)
+    ip = (payload.get("ip")
+          or request.headers.get("X-Forwarded-For", request.remote_addr))
 
     suspicious, severity = judge(payload.get("path"),
                                  payload.get("status_code"),
@@ -289,20 +329,19 @@ def api_collect():
         "severity": severity,
         "site": site,
     }
-    geo = lookup_geo(ip)
-    row.update(geo)
+    row.update(lookup_geo(ip))
 
-    if supabase is not None:
+    sb = get_supabase()
+    if sb is not None:
         try:
-            supabase.table("access_logs").insert(row).execute()
+            sb.table("access_logs").insert(row).execute()
         except Exception as exc:  # noqa: BLE001
-            # severity / site 列が無い環境（移行SQL未実行）でも
-            # 記録そのものは続ける。列を外して1度だけ再試行する。
+            # severity / site 列が無い環境（移行SQL未実行）でも記録は続ける
             logger.error("Supabase insert 失敗: %s", exc)
             try:
                 slim = {k: v for k, v in row.items()
                         if k not in ("severity", "site")}
-                supabase.table("access_logs").insert(slim).execute()
+                sb.table("access_logs").insert(slim).execute()
                 logger.warning("severity/site を外して記録しました。"
                                "移行SQLの実行をおすすめします。")
             except Exception as exc2:  # noqa: BLE001
@@ -321,13 +360,14 @@ def api_stats():
     require_admin()
     hours = int(request.args.get("hours", 24))
     site = (request.args.get("site") or "").strip() or None
-    if supabase is None:
+    sb = get_supabase()
+    if sb is None:
         return jsonify({"error": "supabase not configured"}), 503
 
     # 集計はサーバー側（PostgreSQL）で行う。行数の上限に引っかからない。
     try:
-        rpc = supabase.rpc("stats_recent",
-                           {"p_site": site or "", "p_hours": hours}).execute()
+        rpc = sb.rpc("stats_recent",
+                     {"p_site": site or "", "p_hours": hours}).execute()
         data = rpc.data
         if isinstance(data, list):
             data = data[0] if data else {}
@@ -339,7 +379,7 @@ def api_stats():
     # フォールバック：アプリ側で数える
     since = datetime.now(timezone.utc).timestamp() - hours * 3600
     iso = datetime.fromtimestamp(since, tz=timezone.utc).isoformat()
-    q = (supabase.table("access_logs")
+    q = (sb.table("access_logs")
          .select("country_code,country_name,is_suspicious")
          .gte("ts", iso).limit(20000))
     if site:
@@ -375,10 +415,11 @@ def api_recent():
     limit = min(int(request.args.get("limit", 50)), 500)
     site = (request.args.get("site") or "").strip() or None
     flagged = request.args.get("flagged") in ("1", "true", "yes")
-    if supabase is None:
+    sb = get_supabase()
+    if sb is None:
         return jsonify({"error": "supabase not configured"}), 503
 
-    q = (supabase.table("access_logs")
+    q = (sb.table("access_logs")
          .select("*")
          .order("ts", desc=True)
          .limit(limit))
@@ -441,18 +482,15 @@ def env_report():
 
 @app.route("/api/health", methods=["GET"])
 def api_health():
-    # admin_token_set = サーバーが ADMIN_TOKEN を受け取れているか
-    # （値そのものは絶対に出さない）
-    body = {
+    # admin_token_set = サーバーが ADMIN_TOKEN を受け取れているか（値は出さない）
+    return jsonify({
         "status": "ok",
-        "supabase": supabase is not None,
+        "supabase": get_supabase() is not None,
         "geoip": get_geoip_reader() is not None,
-        "admin_token_set": bool(ADMIN_TOKEN),
-        "admin_token_length": len(ADMIN_TOKEN),
-    }
-    # 名前と空かどうかだけ。値は絶対に出さない。
-    body.update(env_report())
-    return jsonify(body)
+        "admin_token_set": bool(get_admin_token()),
+        "admin_token_length": len(get_admin_token()),
+        **env_report(),
+    })
 
 
 # ------------------------------------------------------------------
@@ -478,13 +516,14 @@ def on_connect():
 def cleanup_loop():
     while True:
         time.sleep(6 * 3600)
-        if supabase is None:
+        sb = get_supabase()
+        if sb is None:
             continue
+        days = get_retention_days()
         try:
-            cutoff = (datetime.now(timezone.utc).timestamp()
-                      - RETENTION_DAYS * 86400)
+            cutoff = datetime.now(timezone.utc).timestamp() - days * 86400
             iso = datetime.fromtimestamp(cutoff, tz=timezone.utc).isoformat()
-            supabase.table("access_logs").delete().lt("ts", iso).execute()
+            sb.table("access_logs").delete().lt("ts", iso).execute()
             logger.info("古いログを削除しました (< %s)", iso)
         except Exception as exc:  # noqa: BLE001
             logger.warning("クリーンアップ失敗: %s", exc)
@@ -500,30 +539,6 @@ def cleanup_loop():
 _bg_started = False
 
 
-def log_config_summary():
-    """起動時に、必要な値が届いているかだけを記録する（値そのものは出さない）"""
-    logger.info("---- 設定の読み込み状況 ----")
-    logger.info("SUPABASE_URL              : %s",
-                "OK" if SUPABASE_URL else "未設定")
-    logger.info("SUPABASE_SERVICE_ROLE_KEY : %s",
-                "OK" if SUPABASE_KEY else "未設定")
-    logger.info("ADMIN_TOKEN               : %s",
-                "OK(長さ%d)" % len(ADMIN_TOKEN) if ADMIN_TOKEN else "未設定")
-    logger.info("RETENTION_DAYS            : %s", RETENTION_DAYS)
-    logger.info("ALLOWED_ORIGINS           : %s", ALLOWED_ORIGINS)
-    logger.info("--------------------------")
-    # 環境変数の「名前」だけを一覧する（値は絶対に出さない）。
-    # キー名の前後に空白があるとアプリからは「未設定」に見えるため、
-    # repr() で空白を可視化する。
-    import os as _os
-    keys = sorted(k for k in _os.environ
-                  if any(t in k.upper() for t in
-                         ("SUPABASE", "ADMIN", "SECRET", "RETENTION",
-                          "ALLOWED", "PYTHON", "FLASK", "MAXMIND", "COLLECT")))
-    logger.info("検出した環境変数の名前: %s",
-                [repr(k) for k in keys] if keys else "(該当なし)")
-
-
 def start_background_jobs():
     global _bg_started
     if _bg_started:
@@ -531,17 +546,16 @@ def start_background_jobs():
     _bg_started = True
     socketio.start_background_task(cleanup_loop)
     logger.info("保持期間クリーンアップを開始しました（%s日保持 / 6時間ごと）",
-                RETENTION_DAYS)
+                get_retention_days())
 
 
 start_background_jobs()
-log_config_summary()
 
 
 # ------------------------------------------------------------------
 if __name__ == "__main__":
     socketio.run(app,
                  host="0.0.0.0",
-                 port=int(os.getenv("PORT", "5000")),
-                 debug=os.getenv("FLASK_ENV") == "development",
+                 port=int(cfg("PORT", "5000")),
+                 debug=cfg("FLASK_ENV") == "development",
                  allow_unsafe_werkzeug=True)
