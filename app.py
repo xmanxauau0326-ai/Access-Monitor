@@ -22,6 +22,7 @@ Flask + Flask-SocketIO + Supabase + MaxMind GeoLite2
 """
 import os
 import re
+import uuid
 import logging
 import threading
 import time
@@ -550,6 +551,26 @@ def supabase_selftest():
                 "error": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
 
 
+# 鍵の種類を判定する。プレフィックスは「種類の識別子」であり秘密ではない
+# （Supabase 公式もプレフィックスの記録は許容している）。
+# 秘密部分は絶対に扱わない。
+KEY_PREFIXES = (
+    ("sb_secret_", "sb_secret（新形式・サーバー用）"),
+    ("sb_publishable_", "sb_publishable（新形式・公開用）"),
+    ("sbp_", "sbp_（個人アクセストークン。データ用ではない）"),
+    ("eyJ", "eyJ…（JWT形式＝レガシー anon / service_role）"),
+)
+
+
+def key_kind(value):
+    if not value:
+        return "未設定"
+    for pre, label in KEY_PREFIXES:
+        if value.startswith(pre):
+            return label
+    return "不明な形式（プレフィックスが既知の4種に一致しません）"
+
+
 def env_shapes():
     """各変数の「形」だけを報告する。値そのものは絶対に含めない。
 
@@ -580,8 +601,8 @@ def env_shapes():
             if k.endswith("URL"):
                 rec["starts_https"] = clean.startswith("https://")
                 rec["is_supabase_co"] = clean.endswith(".supabase.co")
-            if "KEY" in k or "TOKEN" in k:
-                rec["starts_sb_secret"] = clean.startswith("sb_secret_")
+            if "KEY" in k:
+                rec["key_kind"] = key_kind(clean)
         out[k] = rec
     return out
 
@@ -601,6 +622,48 @@ def env_report():
                for k in EXPECTED_ENV if k in os.environ}
     missing = [k for k in EXPECTED_ENV if k not in os.environ]
     return {"present": present, "missing": missing, "suspicious_keys": found}
+
+
+@app.route("/api/selftest", methods=["GET"])
+def api_selftest():
+    """書き込み権限の実テスト。
+
+    読み取りが「空の結果」で成功しても、書き込みが拒否される鍵がある
+    （RLS が有効なテーブル + 権限の低い鍵）。監視ログが保存されるかは
+    書き込みを試さないと分からないため、テスト行を1件挿入して即座に削除する。
+    """
+    require_admin()
+    sb = get_supabase()
+    if sb is None:
+        return jsonify({"ok": False, "stage": "client",
+                        "error": get_supabase_error()}), 503
+    marker = "self-test-" + uuid.uuid4().hex[:12]
+    try:
+        sb.table("access_logs").insert({
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "path": "/__selftest__",
+            "method": "GET",
+            "status_code": 200,
+            "is_suspicious": False,
+            "site": marker,
+        }).execute()
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({
+            "ok": False, "stage": "insert",
+            "error": "%s: %s" % (type(exc).__name__, str(exc)[:300]),
+            "hint": "書き込みが拒否されています。鍵が service_role 相当かを確認してください。",
+        }), 200
+
+    # 後片付け（テスト行を消す）
+    cleanup = "ok"
+    try:
+        sb.table("access_logs").delete().eq("site", marker).execute()
+    except Exception as exc:  # noqa: BLE001
+        cleanup = "失敗: %s" % str(exc)[:200]
+
+    return jsonify({"ok": True, "stage": "insert",
+                    "message": "挿入に成功しました。監視ログは正常に保存されます。",
+                    "cleanup": cleanup})
 
 
 @app.route("/api/health", methods=["GET"])
