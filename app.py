@@ -54,6 +54,42 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------------
 # 設定：毎回 os.environ から読む
 # ------------------------------------------------------------------
+# ------------------------------------------------------------------
+# 環境変数の取得：表記ゆれと「見えない空白」を吸収する
+#
+#   Render 上で「os.environ には40文字あるのに、.strip() すると空になる」
+#   という事象が実際に確認された。ASCII の空白だけを除く str.strip() では
+#   全角スペース等が残る／あるいは値が空白のみ、といった状態を確実に扱うため、
+#   ・キー名は前後空白除去＋大文字化して照合
+#   ・値は Unicode の空白文字を「すべて」除去する
+#   という方式にする（URL も鍵も空白を含まないため安全）。
+# ------------------------------------------------------------------
+def _env_map():
+    """{正規化したキー名: 生の値} を返す"""
+    out = {}
+    for k, v in os.environ.items():
+        out[k.strip().upper()] = v
+    return out
+
+
+def _env_clean(*names):
+    """名前の表記ゆれを吸収して値を取り出し、値中の空白を全て除去して返す"""
+    env = _env_map()
+    for n in names:
+        v = env.get(n.strip().upper())
+        if v is None:
+            continue
+        cleaned = "".join(ch for ch in v if not ch.isspace())
+        if cleaned:
+            return cleaned
+    return ""
+
+
+def _env_raw_len(name):
+    v = _env_map().get(name.strip().upper())
+    return len(v) if v else 0
+
+
 def cfg(name, default=""):
     """環境変数を「その都度」読む。値は文字列。"""
     v = os.getenv(name)
@@ -61,28 +97,28 @@ def cfg(name, default=""):
 
 
 def get_admin_token():
-    """管理者トークン（前後の空白・改行は無視する）"""
-    return (cfg("ADMIN_TOKEN") or "").strip()
+    """管理者トークン（見えない空白も含めて除去して比較する）"""
+    return _env_clean("ADMIN_TOKEN")
 
 
 def get_retention_days():
     try:
-        return int((cfg("RETENTION_DAYS", "31") or "31").strip())
+        return int(_env_clean("RETENTION_DAYS") or "31")
     except (TypeError, ValueError):
         return 31
 
 
 def get_geodb_path():
-    return (cfg("GEOIP_DB_PATH", "GeoLite2-City.mmdb") or "").strip()
+    return _env_clean("GEOIP_DB_PATH") or "GeoLite2-City.mmdb"
 
 
 # ------------------------------------------------------------------
 # Flask / Socket.IO
 # ------------------------------------------------------------------
 app = Flask(__name__)
-app.config["SECRET_KEY"] = cfg("SECRET_KEY", "dev-secret")
+app.config["SECRET_KEY"] = _env_clean("SECRET_KEY") or "dev-secret"
 
-_origins = (cfg("ALLOWED_ORIGINS", "*") or "*").strip() or "*"
+_origins = _env_clean("ALLOWED_ORIGINS") or "*"
 socketio = SocketIO(
     app,
     cors_allowed_origins=("*" if _origins == "*"
@@ -106,17 +142,20 @@ def get_supabase_error():
 def get_supabase():
     """Supabase クライアント。設定が揃った時点で初めて生成する。"""
     global _supabase, _supabase_sig, _supabase_error
-    url = (cfg("https://tjrlshkuwsfbvttqrafg.supabase.co") or "").strip()
-    key = ((cfg("sb_secret_ItGVE13xAzc-IZu_ZKd6lQ_mqOJYkwx") or "").strip()
-           or (cfg("SUPABASE_KEY") or "").strip())
+    url = _env_clean("https://tjrlshkuwsfbvttqrafg.supabase.co")
+    key = _env_clean("sb_secret_ItGVE13xAzc-IZu_ZKd6lQ_mqOJYkwx", "SUPABASE_KEY")
     if create_client is None:
         _supabase_error = "supabase パッケージが読み込めません（import 失敗）"
         return None
     if not url:
-        _supabase_error = "SUPABASE_URL が空です"
+        _supabase_error = ("SUPABASE_URL が空です "
+                           "(os.environ 上の長さ=%d / 空白除去後=%d)"
+                           % (_env_raw_len("SUPABASE_URL"), len(url)))
         return None
     if not key:
-        _supabase_error = "SUPABASE_SERVICE_ROLE_KEY が空です"
+        _supabase_error = ("SUPABASE_SERVICE_ROLE_KEY が空です "
+                           "(os.environ 上の長さ=%d / 空白除去後=%d)"
+                           % (_env_raw_len("SUPABASE_SERVICE_ROLE_KEY"), len(key)))
         return None
     sig = (url, key)
     if _supabase is None or _supabase_sig != sig:
@@ -579,6 +618,6 @@ start_background_jobs()
 if __name__ == "__main__":
     socketio.run(app,
                  host="0.0.0.0",
-                 port=int(cfg("PORT", "5000")),
-                 debug=cfg("FLASK_ENV") == "development",
+                 port=int(_env_clean("PORT") or "5000"),
+                 debug=_env_clean("FLASK_ENV") == "development",
                  allow_unsafe_werkzeug=True)
