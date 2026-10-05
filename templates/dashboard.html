@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Access Monitor — リアルタイム監視</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <h1>Access Monitor</h1>
+  <div class="status"><span id="conn-dot" class="dot"></span><span id="conn-text">接続中…</span></div>
+  <input id="admin-token" type="password" placeholder="管理者トークン" autocomplete="off">
+  <button id="reload">再読込</button>
+</header>
+
+<main class="layout">
+  <section class="map-wrap"><div id="map"></div></section>
+
+  <aside class="side">
+    <div class="card">
+      <h2>直近24時間</h2>
+      <div class="big" id="total">-</div>
+      <div class="sub">総アクセス数</div>
+    </div>
+    <div class="card">
+      <h2>国別</h2>
+      <ul id="country-list" class="list"></ul>
+    </div>
+    <div class="card">
+      <h2>最新アクセス</h2>
+      <ul id="recent-list" class="list mono"></ul>
+    </div>
+  </aside>
+</main>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script>
+const map = L.map('map', { worldCopyJump: true }).setView([20, 0], 2);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 18, attribution: '&copy; OpenStreetMap'
+}).addTo(map);
+
+const markers = [];
+const MAX_MARKERS = 500;
+
+function plot(row) {
+  if (row.latitude == null || row.longitude == null) return;
+  const m = L.circleMarker([row.latitude, row.longitude], {
+    radius: 5, color: '#00e0a4', weight: 1, fillOpacity: 0.6
+  }).addTo(map);
+  m.bindPopup(
+    '<b>' + (row.country_name || '?') + '</b><br>' +
+    (row.city || '') + '<br>' + (row.path || '') +
+    '<br><small>' + (row.ts || '') + '</small>'
+  );
+  markers.push(m);
+  if (markers.length > MAX_MARKERS) map.removeLayer(markers.shift());
+}
+
+function fmt(ts) {
+  try { return new Date(ts).toLocaleString('ja-JP'); } catch (e) { return ts; }
+}
+
+async function loadStats() {
+  const token = document.getElementById('admin-token').value;
+  const res = await fetch('/api/stats?hours=24', { headers: { 'X-Admin-Token': token } });
+  if (!res.ok) return;
+  const data = await res.json();
+  document.getElementById('total').textContent = data.total;
+  const ul = document.getElementById('country-list');
+  ul.innerHTML = '';
+  data.by_country.slice(0, 12).forEach(function (c) {
+    const li = document.createElement('li');
+    li.innerHTML = '<span>' + (c.country_name || c.country_code) + '</span><b>' + c.hits + '</b>';
+    ul.appendChild(li);
+  });
+}
+
+async function loadRecent() {
+  const token = document.getElementById('admin-token').value;
+  const res = await fetch('/api/recent?limit=50', { headers: { 'X-Admin-Token': token } });
+  if (!res.ok) return;
+  const data = await res.json();
+  const ul = document.getElementById('recent-list');
+  ul.innerHTML = '';
+  data.items.forEach(function (r) {
+    const li = document.createElement('li');
+    li.textContent = fmt(r.ts) + ' · ' + (r.country_code || '??') + ' · ' + (r.path || '');
+    ul.appendChild(li);
+  });
+}
+
+const socket = io();
+socket.on('connect', function () {
+  document.getElementById('conn-dot').classList.add('on');
+  document.getElementById('conn-text').textContent = 'リアルタイム接続中';
+});
+socket.on('disconnect', function () {
+  document.getElementById('conn-dot').classList.remove('on');
+  document.getElementById('conn-text').textContent = '切断';
+});
+socket.on('new_access', function (row) {
+  plot(row);
+  const ul = document.getElementById('recent-list');
+  const li = document.createElement('li');
+  li.textContent = fmt(row.ts) + ' · ' + (row.country_code || '??') + ' · ' + (row.path || '');
+  ul.prepend(li);
+  if (ul.children.length > 50) ul.removeChild(ul.lastChild);
+});
+
+document.getElementById('reload').addEventListener('click', function () {
+  loadStats(); loadRecent();
+});
+loadStats();
+loadRecent();
+setInterval(loadStats, 60000);
+</script>
+</body>
+</html>
