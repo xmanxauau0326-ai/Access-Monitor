@@ -4,6 +4,6 @@ python-socketio==5.11.2
 python-engineio==4.9.0
 eventlet==0.36.1
 gunicorn==22.0.0
-supabase==2.6.0
+supabase==2.18.1
 geoip2==4.8.0
 python-dotenv==1.0.1
