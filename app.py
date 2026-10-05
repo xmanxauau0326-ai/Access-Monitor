@@ -48,13 +48,13 @@ logger = logging.getLogger(__name__)
 # ------------------------------------------------------------------
 SUPABASE_URL = os.getenv("https://tjrlshkuwsfbvttqrafg.supabase.co", "")
 SUPABASE_KEY = os.getenv("sb_secret_ItGVE13xAzc-IZu_ZKd6lQ_mqOJYkwx") or os.getenv("SUPABASE_KEY", "")
-ADMIN_TOKEN = os.getenv("8XKqhdkatyVNEDX1cUSTvViwosv9peqGt9n31o1t", "")
+ADMIN_TOKEN = os.getenv("8XKqhdkatyVNEDX1cUSTvViwosv9peqGt9n31o1t", "").strip()
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "31"))
 GEOIP_DB_PATH = os.getenv("GEOIP_DB_PATH", "GeoLite2-City.mmdb")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
 
 app = Flask(__name__)
-app.config["5c2bfc2abee47feea09a24a3cabaa177a87d8c9e1c1a9076bad299ca6c846992"] = os.getenv("SECRET_KEY", "dev-secret")
+app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev-secret")
 socketio = SocketIO(
     app,
     cors_allowed_origins=ALLOWED_ORIGINS.split(",") if ALLOWED_ORIGINS != "*" else "*",
@@ -174,11 +174,16 @@ def list_targets(hours=24):
     """登録済みの監視対象（直近24時間のヒット数を添えて）"""
     if supabase is None:
         return []
-    res = (supabase.table("targets")
-           .select("id,url,host,added")
-           .order("id")
-           .execute())
-    rows = res.data or []
+    try:
+        res = (supabase.table("targets")
+               .select("id,url,host,added")
+               .order("id")
+               .execute())
+        rows = res.data or []
+    except Exception as exc:  # noqa: BLE001
+        # targets テーブル未作成（移行SQLが未実行）でも落とさない
+        logger.warning("targets を読めません。移行SQLを実行してください: %s", exc)
+        return []
 
     counts = {}
     try:
@@ -229,8 +234,13 @@ def delete_target(host):
 # 認証ヘルパ
 # ------------------------------------------------------------------
 def require_admin():
-    token = request.headers.get("X-Admin-Token") or request.args.get("token")
+    # 前後の空白・改行が混ざっていても一致するように strip する
+    token = (request.headers.get("X-Admin-Token")
+             or request.args.get("token")
+             or "").strip()
     if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+        logger.warning("認証失敗: admin_token_set=%s / 受信トークンの長さ=%d",
+                       bool(ADMIN_TOKEN), len(token))
         abort(401)
 
 
@@ -272,7 +282,17 @@ def api_collect():
         try:
             supabase.table("access_logs").insert(row).execute()
         except Exception as exc:  # noqa: BLE001
+            # severity / site 列が無い環境（移行SQL未実行）でも
+            # 記録そのものは続ける。列を外して1度だけ再試行する。
             logger.error("Supabase insert 失敗: %s", exc)
+            try:
+                slim = {k: v for k, v in row.items()
+                        if k not in ("severity", "site")}
+                supabase.table("access_logs").insert(slim).execute()
+                logger.warning("severity/site を外して記録しました。"
+                               "移行SQLの実行をおすすめします。")
+            except Exception as exc2:  # noqa: BLE001
+                logger.error("再試行も失敗しました: %s", exc2)
 
     # ダッシュボードへ秒単位で配信
     socketio.emit("new_access", row)
@@ -384,10 +404,14 @@ def api_targets_delete():
 
 @app.route("/api/health", methods=["GET"])
 def api_health():
+    # admin_token_set = サーバーが ADMIN_TOKEN を受け取れているか
+    # （値そのものは絶対に出さない）
     return jsonify({
         "status": "ok",
         "supabase": supabase is not None,
         "geoip": get_geoip_reader() is not None,
+        "admin_token_set": bool(ADMIN_TOKEN),
+        "admin_token_length": len(ADMIN_TOKEN),
     })
 
 
