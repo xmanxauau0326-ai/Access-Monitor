@@ -126,6 +126,20 @@ def get_geodb_path():
     return _env_clean("GEOIP_DB_PATH") or "GeoLite2-City.mmdb"
 
 
+def get_collect_token():
+    """収集トークン（middleware / Worker と共有）。
+    未設定なら空文字を返し、/api/collect の検証は行わない（後方互換）。"""
+    return _env_clean("COLLECT_TOKEN")
+
+
+def get_collect_max_bytes():
+    """/api/collect の本文サイズ上限（バイト）。0 以下なら無制限。"""
+    try:
+        return int(_env_clean("COLLECT_MAX_BYTES") or "16384")
+    except (TypeError, ValueError):
+        return 16384
+
+
 # ------------------------------------------------------------------
 # Flask / Socket.IO
 # ------------------------------------------------------------------
@@ -139,6 +153,11 @@ socketio = SocketIO(
                           else [o for o in _origins.split(",") if o]),
     async_mode="eventlet",
 )
+
+# 起動時に COLLECT_TOKEN の有無を1回だけ通知（値そのものは出さない）
+if not get_collect_token():
+    logger.warning("COLLECT_TOKEN 未設定: /api/collect は無認証で受け付けます。"
+                   "本番では必ず設定してください。")
 
 
 # ------------------------------------------------------------------
@@ -377,6 +396,23 @@ def require_admin():
 # ------------------------------------------------------------------
 @app.route("/api/collect", methods=["POST"])
 def api_collect():
+    # --- 収集トークン検証（部外者による偽ログ投入を塞ぐ） ---
+    expected_collect = get_collect_token()
+    if expected_collect:
+        got = (request.headers.get("X-Collect-Token") or "").strip()
+        if got != expected_collect:
+            logger.warning("collect 拒否（トークン不一致） remote=%s",
+                           request.headers.get("X-Forwarded-For",
+                                               request.remote_addr))
+            return jsonify({"status": "unauthorized"}), 401
+
+    # --- 本文サイズ上限（巨大payloadによるメモリ圧迫を防ぐ） ---
+    limit = get_collect_max_bytes()
+    if limit and (request.content_length or 0) > limit:
+        logger.warning("collect 拒否（本文が大きすぎます） len=%s limit=%s",
+                       request.content_length, limit)
+        return jsonify({"status": "payload too large"}), 413
+
     payload = request.get_json(silent=True) or {}
     ip = (payload.get("ip")
           or request.headers.get("X-Forwarded-For", request.remote_addr))
