@@ -107,10 +107,16 @@ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
 var markers = [];
 var MAX_MARKERS = 500;
 var targets = [];
+var sites = [];
 var activeSite = null;
+var targetsLoaded = false;
 var SITE_KEY = 'am_site';
 var TOKEN_KEY = 'am_token';
+var TARGETS_KEY = 'am_targets';
+var SITES_KEY = 'am_sites';
 try { activeSite = localStorage.getItem(SITE_KEY) || null; } catch (e) {}
+function saveCache(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) {} }
+function loadCache(k) { try { var s = localStorage.getItem(k); return s ? JSON.parse(s) : null; } catch (e) { return null; } }
 
 function token() { return document.getElementById('admin-token').value; }
 function headers() { return { 'X-Admin-Token': token() }; }
@@ -141,31 +147,45 @@ function readJson(r) {
   return r.ok ? r.json() : null;
 }
 
-function loadSites() {
-  if (!token()) return;
+function siteOptions() {
+  var set = {};
+  (sites || []).forEach(function (s) { if (s) set[s] = 1; });
+  (targets || []).forEach(function (t) { if (t && t.host) set[t.host] = 1; });
+  return Object.keys(set).sort();
+}
+
+function renderSiteOptions() {
+  var sel = document.getElementById('site-filter');
+  if (!sel) return;
+  var cur = activeSite || '';
+  var list = siteOptions();
+  sel.innerHTML = '';
+  var all = document.createElement('option');
+  all.value = ''; all.textContent = '全部のサイト';
+  sel.appendChild(all);
+  list.forEach(function (s) {
+    var o = document.createElement('option');
+    o.value = s; o.textContent = s;
+    sel.appendChild(o);
+  });
+  if (cur && list.indexOf(cur) === -1) {
+    var o2 = document.createElement('option');
+    o2.value = cur; o2.textContent = cur;
+    sel.appendChild(o2);
+  }
+  sel.value = cur;
+}
+
+function loadSites(force) {
+  if (!token()) { renderSiteOptions(); return; }
+  if (!force && sites.length) { renderSiteOptions(); return; }
   fetch('/api/sites', { headers: headers() })
     .then(readJson)
     .then(function (d) {
       if (!d) return;
-      var sel = document.getElementById('site-filter');
-      if (!sel) return;
-      var cur = activeSite || '';
-      var list = d.sites || [];
-      sel.innerHTML = '';
-      var all = document.createElement('option');
-      all.value = ''; all.textContent = '全部のサイト';
-      sel.appendChild(all);
-      list.forEach(function (s) {
-        var o = document.createElement('option');
-        o.value = s; o.textContent = s;
-        sel.appendChild(o);
-      });
-      if (cur && list.indexOf(cur) === -1) {
-        var o2 = document.createElement('option');
-        o2.value = cur; o2.textContent = cur;
-        sel.appendChild(o2);
-      }
-      sel.value = cur;
+      sites = d.sites || [];
+      saveCache(SITES_KEY, sites);
+      renderSiteOptions();
     }).catch(function () {});
 }
 
@@ -203,7 +223,9 @@ function renderTargets() {
   if (!targets.length) {
     var li0 = document.createElement('li');
     li0.className = 'hint';
-    li0.textContent = 'まだ登録されていません。上の欄から追加してください。';
+    li0.textContent = targetsLoaded
+      ? 'まだ登録されていません。上の欄から追加してください。'
+      : '読み込み中…';
     ul.appendChild(li0);
     return;
   }
@@ -237,7 +259,10 @@ function renderTargets() {
 function loadTargets() {
   return fetch('/api/targets').then(function (r) { return r.json(); }).then(function (d) {
     targets = d.targets || [];
+    targetsLoaded = true;
+    saveCache(TARGETS_KEY, targets);
     renderTargets();
+    renderSiteOptions();
   }).catch(function () {});
 }
 
@@ -367,7 +392,7 @@ function loadThreats() {
     }).catch(function () {});
 }
 
-function refreshAll() { loadTargets(); loadSites(); loadStats(); loadRecent(); loadThreats(); }
+function refreshAll(forceSites) { loadTargets(); loadSites(forceSites); loadStats(); loadRecent(); loadThreats(); }
 
 /* ================= タブ ================= */
 document.querySelectorAll('.tab').forEach(function (btn) {
@@ -412,7 +437,7 @@ try { var _t = localStorage.getItem(TOKEN_KEY); if (_t) tokenEl.value = _t; } ca
 tokenEl.addEventListener('change', function () {
   var v = tokenEl.value.trim();
   try { if (v) localStorage.setItem(TOKEN_KEY, v); else localStorage.removeItem(TOKEN_KEY); } catch (e) {}
-  refreshAll();
+  refreshAll(true);
 });
 document.getElementById('site-filter').addEventListener('change', function () {
   var v = this.value || '';
@@ -423,8 +448,13 @@ document.getElementById('site-filter').addEventListener('change', function () {
   refreshAll();
 });
 
+var ct = loadCache(TARGETS_KEY);
+if (ct && ct.length) { targets = ct; targetsLoaded = true; renderTargets(); }
+var cs = loadCache(SITES_KEY);
+if (cs) { sites = cs; }
 setActiveSite(activeSite);
-refreshAll();
+renderSiteOptions();
+refreshAll(true);
 setInterval(loadTargets, 30000);
 setInterval(loadStats, 60000);
 </script>
