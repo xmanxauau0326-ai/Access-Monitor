@@ -541,6 +541,23 @@ def api_recent():
     return jsonify({"items": q.execute().data or []})
 
 
+@app.route("/api/sites", methods=["GET"])
+def api_sites():
+    """記録(access_logs)に現れた site の一覧。登録漏れのサイトも選べるようにする。"""
+    require_admin()
+    sb = get_supabase()
+    if sb is None:
+        return jsonify({"error": "supabase not configured"}), 503
+    try:
+        res = sb.table("access_logs").select("site").limit(5000).execute()
+        sites = sorted({(r.get("site") or "").strip()
+                        for r in (res.data or [])} - {""})
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("site 一覧の取得に失敗: %s", exc)
+        return jsonify({"sites": []})
+    return jsonify({"sites": sites})
+
+
 @app.route("/api/targets", methods=["GET"])
 def api_targets():
     return jsonify({"targets": list_targets()})
@@ -774,7 +791,6 @@ def start_background_jobs():
     socketio.start_background_task(cleanup_loop)
     logger.info("保持期間クリーンアップを開始しました（%s日保持 / 6時間ごと）",
                 get_retention_days())
-
 
 
 start_background_jobs()
