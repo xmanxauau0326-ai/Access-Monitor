@@ -358,6 +358,17 @@ function loadRecent() {
     }).catch(function () {});
 }
 
+function loadMap() {
+  if (!token()) return;
+  fetch('/api/recent?limit=200' + siteQuery(), { headers: headers() })
+    .then(readJson)
+    .then(function (d) {
+      if (!d) return;
+      clearMarkers();                                   // いったん消してから
+      (d.items || []).slice().reverse().forEach(function (r) { plot(r); });  // 古→新の順で描き直す
+    }).catch(function () {});
+}
+
 function loadThreats() {
   if (!token()) return;
   fetch('/api/recent?limit=50&flagged=1' + siteQuery(), { headers: headers() })
@@ -392,7 +403,7 @@ function loadThreats() {
     }).catch(function () {});
 }
 
-function refreshAll(forceSites) { loadTargets(); loadSites(forceSites); loadStats(); loadRecent(); loadThreats(); }
+function refreshAll(forceSites) { loadTargets(); loadSites(forceSites); loadStats(); loadRecent(); loadThreats(); loadMap(); }
 
 /* ================= タブ ================= */
 document.querySelectorAll('.tab').forEach(function (btn) {
