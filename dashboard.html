@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Access Monitor — リアルタイム監視</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="/static/style.css">
+<style>
+/* ===== 監視対象URLバー ===== */
+.targetbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+  padding:8px 14px;background:#0d141c;border-bottom:1px solid #1c2733}
+.targetbar .lbl{font-size:11px;letter-spacing:.14em;color:#7c8b9a}
+.targetbar input{flex:1;min-width:200px;padding:7px 10px;border-radius:6px;
+  border:1px solid #24313f;background:#070b10;color:#e7f0f7;font-size:13px}
+.targetbar button{padding:7px 14px;border-radius:6px;border:1px solid #00e0a4;
+  background:transparent;color:#00e0a4;font-size:13px;cursor:pointer}
+.targetbar button:hover{background:rgba(0,224,164,.12)}
+.targetbar .msg{font-size:12px;color:#7c8b9a}
+.targetbar .msg.ok{color:#00e0a4}
+.targetbar .msg.err{color:#ff4d6d}
+/* ===== タブ ===== */
+.tabs{display:flex;gap:4px;margin-bottom:10px;flex-wrap:wrap}
+.tab{padding:6px 12px;border-radius:6px;border:1px solid #24313f;
+  background:transparent;color:#9fb0c0;font-size:12px;cursor:pointer}
+.tab.on{background:rgba(0,224,164,.12);border-color:#00e0a4;color:#00e0a4}
+.pane{display:none}
+.pane.on{display:block}
+.hint{font-size:12px;color:#7c8b9a;line-height:1.6;margin:0 0 10px}
+.sumline{margin-top:10px;font-size:12px;color:#7c8b9a;border-top:1px solid #1c2733;padding-top:8px}
+.list li.act{background:rgba(0,224,164,.10);border-radius:5px}
+.list li .del{float:right;color:#ff4d6d;cursor:pointer;padding:0 4px}
+.list li .sev{font-size:11px;padding:1px 6px;border-radius:4px;margin-left:6px}
+.sev.high{background:rgba(255,77,109,.18);color:#ff4d6d}
+.sev.medium{background:rgba(255,196,0,.15);color:#ffc400}
+.sev.low{background:rgba(120,160,200,.15);color:#8fb0d0}
+/* ===== サイト選択 ===== */
+#site-filter{padding:7px 10px;border-radius:6px;border:1px solid #24313f;
+  background:#070b10;color:#e7f0f7;font-size:13px;max-width:220px}
+</style>
+</head>
+<body>
+<header class="topbar">
+  <h1>Access Monitor</h1>
+  <div class="status"><span id="conn-dot" class="dot"></span><span id="conn-text">接続中…</span></div>
+  <input id="admin-token" type="password" placeholder="管理者トークン" autocomplete="off">
+  <button id="reload">再読込</button>
+  <select id="site-filter" title="サイトで絞り込み"><option value="">全部のサイト</option></select>
+</header>
+
+<div class="targetbar">
+  <span class="lbl">TARGET URL</span>
+  <input id="target-url" type="text" placeholder="https://example.com" autocomplete="off">
+  <button id="btn-add">＋ 監視対象に追加</button>
+  <button id="btn-export">書き出し</button>
+  <span id="target-msg" class="msg"></span>
+</div>
+
+<main class="layout">
+  <section class="map-wrap"><div id="map"></div></section>
+
+  <aside class="side">
+    <div class="tabs">
+      <button class="tab on" data-tab="targets">対象</button>
+      <button class="tab" data-tab="countries">国別</button>
+      <button class="tab" data-tab="recent">最新</button>
+      <button class="tab" data-tab="threats">検知</button>
+    </div>
+
+    <div class="card pane on" id="pane-targets">
+      <h2>監視対象のサイト</h2>
+      <p class="hint">上の欄にURLを入れて「＋ 監視対象に追加」を押してください。<br>
+        一覧から選ぶと、そのサイトだけの集計に切り替わります。</p>
+      <ul id="target-list" class="list"></ul>
+      <div class="sumline">選択中: <b id="active-site">すべて</b></div>
+    </div>
+
+    <div class="card pane" id="pane-countries">
+      <h2>直近24時間</h2>
+      <div class="big" id="total">-</div>
+      <div class="sub">総アクセス数 <span id="flagged-note"></span></div>
+      <h2 style="margin-top:14px">国別</h2>
+      <ul id="country-list" class="list"></ul>
+    </div>
+
+    <div class="card pane" id="pane-recent">
+      <h2>最新アクセス</h2>
+      <ul id="recent-list" class="list mono"></ul>
+    </div>
+
+    <div class="card pane" id="pane-threats">
+      <h2>不審アクセス</h2>
+      <p class="hint">このサーバーが自力で判定したものだけを表示します。</p>
+      <ul id="threat-list" class="list mono"></ul>
+    </div>
+  </aside>
+</main>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<script>
+var map = L.map('map', { worldCopyJump: true }).setView([20, 0], 2);
+L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+  maxZoom: 18, attribution: '&copy; OpenStreetMap'
+}).addTo(map);
+
+var markers = [];
+var MAX_MARKERS = 500;
+var targets = [];
+var activeSite = null;
+var SITE_KEY = 'am_site';
+var TOKEN_KEY = 'am_token';
+try { activeSite = localStorage.getItem(SITE_KEY) || null; } catch (e) {}
+
+function token() { return document.getElementById('admin-token').value; }
+function headers() { return { 'X-Admin-Token': token() }; }
+
+function setActiveSite(site) {
+  activeSite = site || null;
+  var lbl = document.getElementById('active-site');
+  if (lbl) lbl.textContent = activeSite || 'すべて';
+  var sel = document.getElementById('site-filter');
+  if (sel && sel.value !== (activeSite || '')) sel.value = activeSite || '';
+}
+
+function clearMarkers() {
+  markers.forEach(function (m) { try { map.removeLayer(m); } catch (e) {} });
+  markers.length = 0;
+  map.eachLayer(function (l) { if (l instanceof L.CircleMarker) map.removeLayer(l); });
+}
+
+function authFail() {
+  try { localStorage.removeItem(TOKEN_KEY); } catch (e) {}
+  var el = document.getElementById('admin-token');
+  if (el) el.value = '';
+  msg('管理者トークンが無効です。もう一度入力してください', 'err');
+}
+
+function readJson(r) {
+  if (r.status === 401) { authFail(); return null; }
+  return r.ok ? r.json() : null;
+}
+
+function loadSites() {
+  if (!token()) return;
+  fetch('/api/sites', { headers: headers() })
+    .then(readJson)
+    .then(function (d) {
+      if (!d) return;
+      var sel = document.getElementById('site-filter');
+      if (!sel) return;
+      var cur = activeSite || '';
+      var list = d.sites || [];
+      sel.innerHTML = '';
+      var all = document.createElement('option');
+      all.value = ''; all.textContent = '全部のサイト';
+      sel.appendChild(all);
+      list.forEach(function (s) {
+        var o = document.createElement('option');
+        o.value = s; o.textContent = s;
+        sel.appendChild(o);
+      });
+      if (cur && list.indexOf(cur) === -1) {
+        var o2 = document.createElement('option');
+        o2.value = cur; o2.textContent = cur;
+        sel.appendChild(o2);
+      }
+      sel.value = cur;
+    }).catch(function () {});
+}
+
+function plot(row) {
+  if (row.latitude == null || row.longitude == null) return;
+  if (activeSite && row.site !== activeSite) return;
+  var color = row.is_suspicious ? '#ff4d6d' : '#00e0a4';
+  var m = L.circleMarker([row.latitude, row.longitude], {
+    radius: row.is_suspicious ? 7 : 5, color: color, weight: 1, fillOpacity: 0.6
+  }).addTo(map);
+  m.bindPopup(
+    '<b>' + (row.country_name || '?') + '</b><br>' +
+    (row.city || '') + '<br>' + (row.site || '') + (row.path || '') +
+    (row.is_suspicious ? '<br><span style="color:#ff4d6d">不審 (' + (row.severity || '') + ')</span>' : '') +
+    '<br><small>' + (row.ts || '') + '</small>'
+  );
+  markers.push(m);
+  if (markers.length > MAX_MARKERS) map.removeLayer(markers.shift());
+}
+
+function fmt(ts) {
+  try { return new Date(ts).toLocaleString('ja-JP'); } catch (e) { return ts; }
+}
+
+function msg(text, cls) {
+  var el = document.getElementById('target-msg');
+  el.textContent = text || '';
+  el.className = 'msg' + (cls ? ' ' + cls : '');
+}
+
+/* ================= 監視対象URLの管理 ================= */
+function renderTargets() {
+  var ul = document.getElementById('target-list');
+  ul.innerHTML = '';
+  if (!targets.length) {
+    var li0 = document.createElement('li');
+    li0.className = 'hint';
+    li0.textContent = 'まだ登録されていません。上の欄から追加してください。';
+    ul.appendChild(li0);
+    return;
+  }
+  targets.forEach(function (t) {
+    var li = document.createElement('li');
+    if (t.host === activeSite) li.className = 'act';
+    var span = document.createElement('span');
+    span.textContent = t.host;
+    var b = document.createElement('b');
+    b.textContent = t.hits;
+    var del = document.createElement('span');
+    del.className = 'del';
+    del.textContent = '×';
+    del.title = '削除';
+    del.addEventListener('click', function (e) {
+      e.stopPropagation();
+      removeTarget(t.host);
+    });
+    li.appendChild(span);
+    li.appendChild(b);
+    li.appendChild(del);
+    li.addEventListener('click', function () {
+      setActiveSite(activeSite === t.host ? null : t.host);
+      renderTargets();
+      refreshAll();
+    });
+    ul.appendChild(li);
+  });
+}
+
+function loadTargets() {
+  return fetch('/api/targets').then(function (r) { return r.json(); }).then(function (d) {
+    targets = d.targets || [];
+    renderTargets();
+  }).catch(function () {});
+}
+
+function addTarget() {
+  var v = document.getElementById('target-url').value.trim();
+  if (!v) { msg('URLを入力してください', 'err'); return; }
+  if (!token()) { msg('先に管理者トークンを入れてください', 'err'); return; }
+  msg('追加中…');
+  fetch('/api/targets/add', {
+    method: 'POST',
+    headers: Object.assign({ 'Content-Type': 'application/json' }, headers()),
+    body: JSON.stringify({ url: v })
+  }).then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
+    .then(function (res) {
+      if (!res.ok) { msg(res.d.message || '追加できませんでした', 'err'); return; }
+      targets = res.d.targets || [];
+      document.getElementById('target-url').value = '';
+      msg('監視対象に追加しました: ' + res.d.target.host, 'ok');
+      renderTargets();
+      refreshAll();
+    }).catch(function () { msg('通信に失敗しました', 'err'); });
+}
+
+function removeTarget(host) {
+  if (!token()) { msg('先に管理者トークンを入れてください', 'err'); return; }
+  fetch('/api/targets/delete', {
+    method: 'POST',
+    headers: Object.assign({ 'Content-Type': 'application/json' }, headers()),
+    body: JSON.stringify({ host: host })
+  }).then(function (r) { return r.json(); }).then(function (d) {
+    if (d.status !== 'ok') { msg(d.message || '削除できませんでした', 'err'); return; }
+    targets = d.targets || [];
+    msg('削除しました: ' + host, 'ok');
+    renderTargets();
+    refreshAll();
+  }).catch(function () { msg('通信に失敗しました', 'err'); });
+}
+
+function exportTargets() {
+  var blob = new Blob([JSON.stringify({ exported_at: new Date().toISOString(), targets: targets }, null, 2)],
+                      { type: 'application/json' });
+  var a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'access-monitor-targets.json';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+/* ================= 統計・一覧 ================= */
+function siteQuery() {
+  return activeSite ? '&site=' + encodeURIComponent(activeSite) : '';
+}
+
+function loadStats() {
+  if (!token()) return;
+  fetch('/api/stats?hours=24' + siteQuery(), { headers: headers() })
+    .then(readJson)
+    .then(function (d) {
+      if (!d) return;
+      document.getElementById('total').textContent = d.total;
+      document.getElementById('flagged-note').textContent =
+        d.flagged ? '／ 不審 ' + d.flagged + ' 件' : '';
+      var ul = document.getElementById('country-list');
+      ul.innerHTML = '';
+      (d.by_country || []).slice(0, 12).forEach(function (c) {
+        var li = document.createElement('li');
+        var name = document.createElement('span');
+        name.textContent = c.country_name || c.country_code;
+        var b = document.createElement('b');
+        b.textContent = c.hits + (c.suspicious ? ' (' + c.suspicious + ')' : '');
+        li.appendChild(name);
+        li.appendChild(b);
+        if (c.suspicious) li.classList.add('act');
+        ul.appendChild(li);
+      });
+    }).catch(function () {});
+}
+
+function loadRecent() {
+  if (!token()) return;
+  fetch('/api/recent?limit=50' + siteQuery(), { headers: headers() })
+    .then(readJson)
+    .then(function (d) {
+      if (!d) return;
+      var ul = document.getElementById('recent-list');
+      ul.innerHTML = '';
+      (d.items || []).forEach(function (r) {
+        var li = document.createElement('li');
+        li.textContent = fmt(r.ts) + ' · ' + (r.country_code || '??') + ' · ' + (r.path || '');
+        if (r.is_suspicious) li.classList.add('act');
+        ul.appendChild(li);
+      });
+    }).catch(function () {});
+}
+
+function loadThreats() {
+  if (!token()) return;
+  fetch('/api/recent?limit=50&flagged=1' + siteQuery(), { headers: headers() })
+    .then(readJson)
+    .then(function (d) {
+      if (!d) return;
+      var ul = document.getElementById('threat-list');
+      ul.innerHTML = '';
+      if (!(d.items || []).length) {
+        var li0 = document.createElement('li');
+        li0.className = 'hint';
+        li0.textContent = '不審アクセスは検知されていません。';
+        ul.appendChild(li0);
+        return;
+      }
+      d.items.forEach(function (r) {
+        var li = document.createElement('li');
+        var t = document.createElement('span');
+        t.textContent = fmt(r.ts) + ' · ' + (r.country_code || '??');
+        var p = document.createElement('span');
+        p.textContent = ' ' + (r.path || '');
+        li.appendChild(t);
+        li.appendChild(p);
+        if (r.severity) {
+          var s = document.createElement('span');
+          s.className = 'sev ' + r.severity;
+          s.textContent = r.severity;
+          li.appendChild(s);
+        }
+        ul.appendChild(li);
+      });
+    }).catch(function () {});
+}
+
+function refreshAll() { loadTargets(); loadSites(); loadStats(); loadRecent(); loadThreats(); }
+
+/* ================= タブ ================= */
+document.querySelectorAll('.tab').forEach(function (btn) {
+  btn.addEventListener('click', function () {
+    document.querySelectorAll('.tab').forEach(function (b) { b.classList.remove('on'); });
+    document.querySelectorAll('.pane').forEach(function (p) { p.classList.remove('on'); });
+    btn.classList.add('on');
+    document.getElementById('pane-' + btn.dataset.tab).classList.add('on');
+  });
+});
+
+/* ================= リアルタイム ================= */
+var socket = io();
+socket.on('connect', function () {
+  document.getElementById('conn-dot').classList.add('on');
+  document.getElementById('conn-text').textContent = 'リアルタイム接続中';
+});
+socket.on('disconnect', function () {
+  document.getElementById('conn-dot').classList.remove('on');
+  document.getElementById('conn-text').textContent = '切断';
+});
+socket.on('new_access', function (row) {
+  if (activeSite && row.site !== activeSite) return;
+  plot(row);
+  var ul = document.getElementById('recent-list');
+  var li = document.createElement('li');
+  li.textContent = fmt(row.ts) + ' · ' + (row.country_code || '??') + ' · ' + (row.path || '');
+  if (row.is_suspicious) li.classList.add('act');
+  ul.prepend(li);
+  if (ul.children.length > 50) ul.removeChild(ul.lastChild);
+});
+
+/* ================= 起動 ================= */
+document.getElementById('btn-add').addEventListener('click', addTarget);
+document.getElementById('btn-export').addEventListener('click', exportTargets);
+document.getElementById('target-url').addEventListener('keydown', function (e) {
+  if (e.key === 'Enter') addTarget();
+});
+document.getElementById('reload').addEventListener('click', refreshAll);
+var tokenEl = document.getElementById('admin-token');
+try { var _t = localStorage.getItem(TOKEN_KEY); if (_t) tokenEl.value = _t; } catch (e) {}
+tokenEl.addEventListener('change', function () {
+  var v = tokenEl.value.trim();
+  try { if (v) localStorage.setItem(TOKEN_KEY, v); else localStorage.removeItem(TOKEN_KEY); } catch (e) {}
+  refreshAll();
+});
+document.getElementById('site-filter').addEventListener('change', function () {
+  var v = this.value || '';
+  try { if (v) localStorage.setItem(SITE_KEY, v); else localStorage.removeItem(SITE_KEY); } catch (e) {}
+  setActiveSite(v || null);
+  clearMarkers();
+  renderTargets();
+  refreshAll();
+});
+
+setActiveSite(activeSite);
+refreshAll();
+setInterval(loadTargets, 30000);
+setInterval(loadStats, 60000);
+</script>
+<script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v4bc70e2c01a94c73b74392e4234840661791215815920" integrity="sha512-L0ha0OXavK/8okipN9F8BtP84dg9DUhPERbBXzwI6dgTA55d2+yweo3pn5CSFYs45/r8md2+xvUPtTdvTNRfjA==" data-cf-beacon='{"version":"2024.11.0","token":"4edd5f8ec12a48cfa682ab8261b80a79","spa":2}' crossorigin="anonymous"></script>
+</body>
+</html>
